@@ -1,126 +1,114 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# DigitalOcean API Configuration
-DO_TOKEN="dop_v1_353ac5378198b18e98925df8d61fe61b63fc3c210ec566dbe38248909ef56343"
-SERVER_PUBLIC_IP_ADDRESS="213.199.54.105"
-DOMAIN="beta.artslabcreatives.com"
+ROOT_DIR=$(cd "$(dirname "$0")" && pwd)
+ENV_FILE="${ROOT_DIR}/.env"
 
+if [[ ! -f "${ENV_FILE}" ]]; then
+  echo "Missing .env file. Copy .env.example to .env and fill values." && exit 1
+fi
+set -a
+# shellcheck disable=SC1090
+source "${ENV_FILE}"
+set +a
 
-# Function to create a subdomain on DigitalOcean
+for key in DO_TOKEN SERVER_PUBLIC_IP_ADDRESS DOMAIN; do
+  if [[ -z "${!key:-}" ]]; then
+    echo "Missing required var ${key} in .env" && exit 1
+  fi
+done
+
+retry() {
+  local attempts=$1 delay=$2; shift 2
+  local cmd=("$@")
+  local tries=0
+  until "${cmd[@]}"; do
+    tries=$((tries+1))
+    if (( tries >= attempts )); then
+      return 1
+    fi
+    sleep "${delay}"
+  done
+}
+
 create_subdomain() {
-  local subdomain=$1
-  local target_ip=$2
-  
-  echo "Creating DNS record for $subdomain.$DOMAIN pointing to $target_ip"
-  
-  local response=$(curl -s -X POST \
+  local subdomain=$1 target_ip=$2
+  echo "Ensuring DNS record for ${subdomain}.${DOMAIN}"
+  local existing=$(curl -s -X GET -H "Authorization: Bearer ${DO_TOKEN}" "https://api.digitalocean.com/v2/domains/${DOMAIN}/records" | jq -r ".domain_records[] | select(.type==\"A\" and .name==\"${subdomain}\") | .id")
+  if [[ -n "${existing}" ]]; then
+    echo "DNS record already exists (id ${existing}), skipping"
+    return
+  fi
+  retry 3 5 curl -s -X POST \
     -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $DO_TOKEN" \
-    -d "{\"type\":\"A\",\"name\":\"$subdomain\",\"data\":\"$target_ip\",\"ttl\":3600}" \
-    "https://api.digitalocean.com/v2/domains/$DOMAIN/records")
-  
-  if echo "$response" | grep -q "id"; then
-    echo "DNS record created successfully for $subdomain.$DOMAIN"
-    return 0
+    -H "Authorization: Bearer ${DO_TOKEN}" \
+    -d "{\"type\":\"A\",\"name\":\"${subdomain}\",\"data\":\"${target_ip}\",\"ttl\":3600}" \
+    "https://api.digitalocean.com/v2/domains/${DOMAIN}/records"
+}
+
+prompt_value() {
+  local label=$1 default=${2-}
+  if command -v whiptail >/dev/null 2>&1; then
+    whiptail --inputbox "${label}" 10 60 "${default}" 3>&1 1>&2 2>&3
   else
-    echo "Failed to create DNS record. Response: $response"
-    return 1
+    read -rp "${label} [${default}]: " ans
+    echo "${ans:-${default}}"
   fi
 }
 
-# Prompt for main domain
-echo "1] Domain"
-echo "2] Subdomain"
-read -p "Domain or subdomain to beta.artslabcreatives.com: " CHOICE
+install_log="${ROOT_DIR}/logs/nginx-$(date +%Y%m%d-%H%M%S).log"
+mkdir -p "${ROOT_DIR}/logs"
+exec > >(tee -a "${install_log}") 2>&1
 
-if [ "$CHOICE" != "1" ] && [ "$CHOICE" != "2" ]; then
-	echo "Invalid choice. Exiting."
-	exit 1
-fi
+FULL_DOMAIN=$(prompt_value "Enter full domain (e.g., app.${DOMAIN})" "app.${DOMAIN}")
+DEPLOY_TYPE=$(prompt_value "Type dir or proxy" "dir")
 
-if [ "$CHOICE" == "1" ]; then
-	read -p "Enter the main domain (e.g., beta.artslabcreatives.com): " DOMAIN
-	if [ "$DOMAIN" != "beta.artslabcreatives.com" ]; then
-		echo "Only beta.artslabcreatives.com is allowed. Exiting."
-		exit 1
-	fi
-elif [ "$CHOICE" == "2" ]; then
-  DOMAIN="beta.artslabcreatives.com"
-  read -p "Enter the subdomain (e.g., myapp): " SUBDOMAIN
-  if [ -z "$SUBDOMAIN" ]; then
-      echo "Subdomain cannot be empty. Exiting."
-      exit 1
-  fi
-    # Create subdomain A record in DigitalOcean
-    if create_subdomain "$SUBDOMAIN" "$SERVER_PUBLIC_IP_ADDRESS"; then
-      echo "DNS A record for $SUBDOMAIN.$DOMAIN created successfully."
-    else
-      echo "Failed to create DNS record for $SUBDOMAIN.$DOMAIN. Please check your DigitalOcean token and permissions."
-      read -p "Do you want to continue with the rest of the setup anyway? (y/n): " continue_setup
-      if [[ "$continue_setup" != "y" ]]; then
-        exit 1
-      fi
-    fi
-fi
+echo "Using domain ${FULL_DOMAIN}"
+SUBDOMAIN=${FULL_DOMAIN%%.${DOMAIN}}
+create_subdomain "${SUBDOMAIN}" "${SERVER_PUBLIC_IP_ADDRESS}"
 
-# Build full domain
-if [ -n "$SUBDOMAIN" ]; then
-    FULL_DOMAIN="$SUBDOMAIN.$DOMAIN"
+if [[ "${DEPLOY_TYPE}" == "dir" ]]; then
+  DIR_PATH=$(prompt_value "Enter directory path" "/var/www/html")
+  CONFIG_CONTENT=$(cat <<CONF
+server {
+    listen 80;
+    server_name ${FULL_DOMAIN};
+    root ${DIR_PATH};
+    index index.php index.html index.htm;
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+    location ~ \.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/var/run/php/php8.1-fpm.sock;
+    }
+}
+CONF
+)
+elif [[ "${DEPLOY_TYPE}" == "proxy" ]]; then
+  PROXY_PASS=$(prompt_value "Enter proxy target (host:port)" "127.0.0.1:3000")
+  CONFIG_CONTENT=$(cat <<CONF
+server {
+    listen 80;
+    server_name ${FULL_DOMAIN};
+    location / {
+        proxy_pass http://${PROXY_PASS};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+CONF
+)
 else
-    FULL_DOMAIN="$DOMAIN"
+  echo "Invalid deploy type" && exit 1
 fi
 
-# Create DNS Record for the subdomain
-if create_subdomain "$site_name" "$SERVER_PUBLIC_IP_ADDRESS"; then
-  echo "DNS record has been created. It may take some time to propagate."
-else
-  echo "Failed to create DNS record. Please check your DigitalOcean token and permissions."
-  read -p "Do you want to continue with the rest of the setup anyway? (y/n): " continue_setup
-  if [[ "$continue_setup" != "y" ]]; then
-    exit 1
-  fi
-fi
+CONF_PATH="/etc/nginx/sites-available/${FULL_DOMAIN}"
+echo "${CONFIG_CONTENT}" | sudo tee "${CONF_PATH}" >/dev/null
+sudo ln -sf "${CONF_PATH}" "/etc/nginx/sites-enabled/${FULL_DOMAIN}"
+sudo nginx -t
+sudo systemctl reload nginx
 
-echo "Domain to configure: $FULL_DOMAIN"
-
-# Ask for type: directory or reverse proxy
-read -p "Should this point to a local directory or reverse proxy? (dir/proxy): " TYPE
-
-if [ "$TYPE" == "dir" ]; then
-
-    read -p "Enter the directory path (e.g., /var/www/html): " DIR_PATH
-    CONFIG="server {
-        listen 80;
-        server_name $FULL_DOMAIN;
-        root $DIR_PATH;
-        index index.html index.htm;
-
-        location / {
-            try_files \$uri \$uri/ =404;
-        }
-    }"
-elif [ "$TYPE" == "proxy" ]; then
-    read -p "Enter the IP address and port to proxy to (e.g., 127.0.0.1:3000): " PROXY_PASS
-    CONFIG="server {
-        listen 80;
-        server_name $FULL_DOMAIN;
-
-        location / {
-            proxy_pass http://$PROXY_PASS;
-            proxy_set_header Host \$host;
-            proxy_set_header X-Real-IP \$remote_addr;
-            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto \$scheme;
-        }
-    }"
-else
-    echo "Invalid type. Exiting."
-    exit 1
-fi
-
-CONF_PATH="/etc/nginx/sites-available/$FULL_DOMAIN"
-echo "$CONFIG" | sudo tee "$CONF_PATH" > /dev/null
-sudo ln -sf "$CONF_PATH" "/etc/nginx/sites-enabled/$FULL_DOMAIN"
-echo "Nginx config created at $CONF_PATH and enabled."
-echo "Test Nginx config with: sudo nginx -t"
-echo "Reload Nginx with: sudo systemctl reload nginx"
+echo "Nginx config written to ${CONF_PATH} (log: ${install_log})"
