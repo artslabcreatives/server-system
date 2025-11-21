@@ -14,7 +14,7 @@ apt autoremove
 apt -y autoclean 
 apt -y clean 
 apt update
-reboot
+
 
 # Docker Install
 
